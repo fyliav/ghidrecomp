@@ -311,14 +311,75 @@ class CallGraph:
 
 
 @lru_cache(None)
-def get_calling_funcs_memo(f: "ghidra.program.model.listing.Function"):
-    return list(f.getCallingFunctions(None))
+def get_calling_funcs_memo(func, include_refs=True):
+    """
+    Given a Function, return a set of Functions that call it.
+    Only call references are included (non-call references are skipped).
+    """
+
+    callers = set()
+    if not func:
+        return callers
+
+    program = func.getProgram()
+    ref_manager = program.getReferenceManager()
+    func_manager = program.getFunctionManager()
+
+    entry_point = func.getEntryPoint()
+    ref_iter = ref_manager.getReferencesTo(entry_point)
+
+    while ref_iter.hasNext():
+        ref = ref_iter.next()
+        if not ref.getReferenceType().isCall() and not include_refs:
+            continue
+
+        from_addr = ref.getFromAddress()
+        caller_func = func_manager.getFunctionContaining(from_addr)
+        if caller_func:
+            callers.add(caller_func)
+
+    return list(callers)
 
 
 @lru_cache(None)
-def get_called_funcs_memo(f: "ghidra.program.model.listing.Function"):
-    return list(f.getCalledFunctions(None))
+def get_called_funcs_memo(func:"ghidra.program.model.listing.Function", include_refs=True):
+    """
+    Given a Function, return a list of Functions that it calls.
+    Only call references are included (non-call references are skipped unless include_refs=True).
+    """
 
+    callees = set()
+    if not func:
+        return list(callees)
+
+    program = func.getProgram()
+    ref_manager = program.getReferenceManager()
+    func_manager = program.getFunctionManager()
+
+    # Iterate through all address ranges in the function body
+    range_iter = func.getBody().getAddressRanges()
+
+    while range_iter.hasNext():
+        addr_range = range_iter.next()
+        ref_iter = ref_manager.getReferenceIterator(addr_range.getMinAddress())
+
+        while ref_iter.hasNext():
+            ref = ref_iter.next()
+
+            # Stop if we've moved outside the current address range
+            if not addr_range.contains(ref.getFromAddress()):
+                break
+
+            # Skip non-call references unless include_refs=True
+            if not ref.getReferenceType().isCall() and not include_refs:
+                continue
+
+            # Look up the callee function at the reference's destination
+            callee = func_manager.getFunctionAt(ref.getToAddress())
+            if callee:
+                callees.add(callee)
+
+    return list(callees)
 
 # Recursively calling to build calling graph
 def get_calling(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = None, depth: int = 0, visited: tuple = None, verbose=False, include_ns=True, start_time=None, max_run_time=None, max_depth=MAX_DEPTH):
