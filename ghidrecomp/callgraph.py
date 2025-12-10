@@ -29,6 +29,7 @@ def add_cg_args_to_parser(parser: argparse.ArgumentParser):
     group.add_argument('--max-time-cg-gen', help='Max time in seconds to wait for callgraph gen.', default=5)
     group.add_argument('--cg-direction', help='Direction for callgraph.',
                        choices=['calling', 'called', 'both'], default='calling')
+    group.add_argument('--no-call-refs', action='store_true', help='Do not include non-call references in callgraph')
 
 
 
@@ -45,14 +46,14 @@ class CallGraph:
         self.graph.setdefault(root, [])
         self.root = root
 
-    def add_edge(self, node1, node2, depth):
+    def add_edge(self, node1, node2, depth, ref_type):
 
         assert self.root is not None, 'root node must be set prior to adding an edge'
 
         self.graph.setdefault(node1, [])
         self.graph.setdefault(node2, [])
 
-        self.graph[node1].append((node2, depth, self.count))
+        self.graph[node1].append((node2, depth, self.count, ref_type))
         self.count += 1
 
         # update max depth
@@ -139,6 +140,33 @@ class CallGraph:
                 count += 1
 
         return count
+
+    def is_reachable(self, source_func: str, dest_func: str) -> bool:
+        """
+        Determines if dest_func is reachable from source_func by traversing the callgraph.
+        """
+        if source_func not in self.graph or dest_func not in self.graph:
+            raise ValueError('Source function does not exist in callgraph')
+
+        if source_func == dest_func:
+            return True
+
+        queue = [source_func]
+        visited = {source_func}
+
+        while queue:
+            current_func = queue.pop(0)
+
+            # In this graph, an edge (u, v) means u calls v.
+            # self.graph[current_func] is a list of (neighbor, depth, count, ref_type)
+            for neighbor, _, _, _ in self.graph.get(current_func, []):
+                if neighbor == dest_func:
+                    return True
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+
+        return False
     
     @staticmethod
     def remove_bad_mermaid_chars(text: str):
@@ -218,6 +246,7 @@ class CallGraph:
 
                         depth = node[1]
                         fname = node[0]
+                        ref_type = node[3]
 
                         if max_display_depth is not None and depth > max_display_depth:
                             continue
@@ -249,7 +278,10 @@ class CallGraph:
 
                         # don't add link if another already exists
                         if not current_base_link in existing_base_links:
-                            link = f'{src_node} --> {dst_node}'
+                            if ref_type == 'ref':
+                                link = f'{src_node} -- ref --> {dst_node}'
+                            else: # 'call'
+                                link = f'{src_node} --> {dst_node}'
                             links[link] = 1
                             existing_base_links.add(current_base_link)
                         # else:
@@ -317,9 +349,9 @@ def get_calling_funcs_memo(func, include_refs=True):
     Only call references are included (non-call references are skipped).
     """
 
-    callers = set()
+    callers = {}  # func -> is_call (boolean, True if any reference is a call)
     if not func:
-        return callers
+        return []
 
     program = func.getProgram()
     ref_manager = program.getReferenceManager()
@@ -330,15 +362,19 @@ def get_calling_funcs_memo(func, include_refs=True):
 
     while ref_iter.hasNext():
         ref = ref_iter.next()
-        if not ref.getReferenceType().isCall() and not include_refs:
+        is_call = ref.getReferenceType().isCall()
+        if not is_call and not include_refs:
             continue
 
         from_addr = ref.getFromAddress()
         caller_func = func_manager.getFunctionContaining(from_addr)
         if caller_func:
-            callers.add(caller_func)
+            # If we already have an entry for this caller,
+            # we only update it if the new reference is a 'call'.
+            if caller_func not in callers or not callers[caller_func]:
+                callers[caller_func] = is_call
 
-    return list(callers)
+    return [(f, 'call' if is_call else 'ref') for f, is_call in callers.items()]
 
 
 @lru_cache(None)
@@ -348,9 +384,9 @@ def get_called_funcs_memo(func:"ghidra.program.model.listing.Function", include_
     Only call references are included (non-call references are skipped unless include_refs=True).
     """
 
-    callees = set()
+    callees = {} # func -> is_call
     if not func:
-        return list(callees)
+        return []
 
     program = func.getProgram()
     ref_manager = program.getReferenceManager()
@@ -370,19 +406,21 @@ def get_called_funcs_memo(func:"ghidra.program.model.listing.Function", include_
             if not addr_range.contains(ref.getFromAddress()):
                 break
 
+            is_call = ref.getReferenceType().isCall()
             # Skip non-call references unless include_refs=True
-            if not ref.getReferenceType().isCall() and not include_refs:
+            if not is_call and not include_refs:
                 continue
 
             # Look up the callee function at the reference's destination
             callee = func_manager.getFunctionAt(ref.getToAddress())
             if callee:
-                callees.add(callee)
+                if callee not in callees or not callees[callee]:
+                    callees[callee] = is_call
 
-    return list(callees)
+    return [(f, 'call' if is_call else 'ref') for f, is_call in callees.items()]
 
 # Recursively calling to build calling graph
-def get_calling(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = None, depth: int = 0, visited: tuple = None, verbose=False, include_ns=True, start_time=None, max_run_time=None, max_depth=MAX_DEPTH):
+def get_calling(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = None, depth: int = 0, visited: tuple = None, verbose=False, include_ns=True, start_time=None, max_run_time=None, max_depth=MAX_DEPTH, include_refs=True):
     """
     Build a call graph of all calling functions
     Traverses depth first
@@ -402,12 +440,12 @@ def get_calling(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = 
         start_time = time.time()
 
     if depth == MAX_DEPTH:
-        cgraph.add_edge(f.getName(include_ns), f'MAX_DEPTH_HIT - {depth}', depth)
+        cgraph.add_edge(f.getName(include_ns), f'MAX_DEPTH_HIT - {depth}', depth, 'call')
         return cgraph
 
     if (time.time() - start_time) > float(max_run_time):
         #raise TimeoutError(f'time expired for {clean_func(f,include_ns)}')
-        cgraph.add_edge(f.getName(include_ns), f'MAX_TIME_HIT - time: {max_run_time} depth: {depth}', depth)
+        cgraph.add_edge(f.getName(include_ns), f'MAX_TIME_HIT - time: {max_run_time} depth: {depth}', depth, 'call')
         print(f'\nWarn: cg : {cgraph.root} edges: {cgraph.links_count()} depth: {depth} name: {f.name} did not complete. max_run_time: {max_run_time} Increase timeout with --max-time-cg-gen MAX_TIME_CG_GEN')
         return cgraph
 
@@ -422,7 +460,7 @@ def get_calling(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = 
 
         return cgraph
 
-    calling = get_calling_funcs_memo(f)
+    calling = get_calling_funcs_memo(f, include_refs=include_refs)
 
     visited = visited + tuple([f.getName(True)])
 
@@ -430,16 +468,16 @@ def get_calling(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = 
 
         depth = depth+1
 
-        for c in calling:
+        for c, ref_type in calling:
 
             if verbose:
                 print(f"{space} - {c.getName(include_ns)}")
 
             # Add calling edge
-            cgraph.add_edge(c.getName(include_ns), f.getName(include_ns), depth)
+            cgraph.add_edge(c.getName(include_ns), f.getName(include_ns), depth, ref_type)
 
             # Parse further functions
-            cgraph = get_calling(c, cgraph, depth, visited=visited, start_time=start_time, max_run_time=max_run_time, max_depth=max_depth)
+            cgraph = get_calling(c, cgraph, depth, visited=visited, start_time=start_time, max_run_time=max_run_time, max_depth=max_depth, include_refs=include_refs)
     else:
         if verbose:
             print(f'{space} - END for {f.name}')
@@ -454,7 +492,7 @@ def func_is_external(f: "ghidra.program.model.listing.Function"):
 # Recursively calling to build called graph
 
 
-def get_called(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = None, depth: int = 0, visited: list = [], verbose=False, include_ns=True, start_time=None, max_run_time=None, max_depth=MAX_DEPTH):
+def get_called(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = None, depth: int = 0, visited: list = [], verbose=False, include_ns=True, start_time=None, max_run_time=None, max_depth=MAX_DEPTH, include_refs=True):
     """
     Build a call graph of all called functions
     Traverses depth first
@@ -474,11 +512,11 @@ def get_called(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = N
         start_time = time.time()
 
     if depth == max_depth:
-        cgraph.add_edge(f.getName(include_ns), f'MAX_DEPTH_HIT - {depth}', depth)
+        cgraph.add_edge(f.getName(include_ns), f'MAX_DEPTH_HIT - {depth}', depth, 'call')
         return cgraph
 
     if (time.time() - start_time) > float(max_run_time):
-        cgraph.add_edge(f.getName(include_ns), f'MAX_TIME_HIT - time: {max_run_time} depth: {depth}', depth)
+        cgraph.add_edge(f.getName(include_ns), f'MAX_TIME_HIT - time: {max_run_time} depth: {depth}', depth, 'call')
         print(f'\nWarn: cg : {cgraph.root} edges: {cgraph.links_count()} depth: {depth} name: {f.name} did not complete. max_run_time: {max_run_time} Increase timeout with --max-time-cg-gen MAX_TIME_CG_GEN')
         return cgraph
         
@@ -495,7 +533,7 @@ def get_called(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = N
 
     visited = visited + tuple([f.getName(True)])
 
-    called = get_called_funcs_memo(f)
+    called = get_called_funcs_memo(f, include_refs=include_refs)
 
     if len(called) > 0:
 
@@ -505,7 +543,7 @@ def get_called(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = N
 
             depth = depth+1
 
-            for c in called:
+            for c, ref_type in called:
                 c: "ghidra.program.model.listing.Function" = c
 
                 if verbose:
@@ -515,14 +553,14 @@ def get_called(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = N
                 if func_is_external(c):
 
                     # force external to show namespace lib with sendind param True
-                    cgraph.add_edge(f.getName(include_ns), f"{c.getName(True)}", depth)
+                    cgraph.add_edge(f.getName(include_ns), f"{c.getName(True)}", depth, ref_type)
 
                 else:
-                    cgraph.add_edge(f.getName(include_ns), c.getName(include_ns), depth)
+                    cgraph.add_edge(f.getName(include_ns), c.getName(include_ns), depth, ref_type)
 
                     # Parse further functions
                     cgraph = get_called(c, cgraph, depth, visited=visited,
-                                        start_time=start_time, max_run_time=max_run_time, max_depth=max_depth)
+                                        start_time=start_time, max_run_time=max_run_time, max_depth=max_depth, include_refs=include_refs)
 
     else:
         if verbose:
@@ -608,7 +646,7 @@ A condensed view, showing only endpoints of the callgraph.
     return md_template
 
 
-def gen_callgraph(func: 'ghidra.program.model.listing.Function', max_display_depth=None, direction='calling', max_run_time=None, name=None):
+def gen_callgraph(func: 'ghidra.program.model.listing.Function', max_display_depth=None, direction='calling', max_run_time=None, name=None, include_refs=True):
 
     if name is None:
         name = f'{func.getName()[:MAX_PATH_LEN]}-{func.entryPoint}'    
@@ -618,9 +656,9 @@ def gen_callgraph(func: 'ghidra.program.model.listing.Function', max_display_dep
     callgraph = None
 
     if direction == 'calling':
-        callgraph = get_calling(func, max_run_time=max_run_time)
+        callgraph = get_calling(func, max_run_time=max_run_time, include_refs=include_refs)
     elif direction == 'called':
-        callgraph = get_called(func, max_run_time=max_run_time)
+        callgraph = get_called(func, max_run_time=max_run_time, include_refs=include_refs)
     else:
         raise Exception(f'Unsupported callgraph direction {direction}')
 

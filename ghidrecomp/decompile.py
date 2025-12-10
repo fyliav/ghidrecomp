@@ -317,8 +317,10 @@ def decompile(args: Namespace):
                 if args.max_display_depth is not None:
                     max_display_depth = int(args.max_display_depth)
 
+                
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
-                    futures = (executor.submit(gen_callgraph, func, max_display_depth, direction, args.max_time_cg_gen, get_filename(func))
+                    futures = (executor.submit(gen_callgraph, func, max_display_depth, direction, args.max_time_cg_gen, get_filename(func), not args.no_call_refs)
                                for direction in directions for func in all_funcs if args.skip_cache or get_filename(func) not in callgraphs_completed and re.search(args.callgraph_filter, func.name) is not None)
 
                     for future in concurrent.futures.as_completed(futures):
