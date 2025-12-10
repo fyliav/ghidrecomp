@@ -24,7 +24,7 @@ jobs:
         # cover the latest and all versions of all subreleases   
         image: [
           "latest",
-          "11.4.1ghidra3.13python-bookworm",
+          "11.4.2ghidra3.13python-bookworm",
           "11.3.2ghidra3.12python-bookworm",
           "11.3ghidra3.10python-bookworm",
           ]
@@ -51,7 +51,13 @@ jobs:
           env
           ls /usr/local/include/
           pip install --upgrade pip
+          
+          # If Ghidra major version is 11 (allows testing pre pyghidra 3.0)
+          if [[ "$GHIDRA_VERSION" == 11.* ]]; then
+            echo "Detected Ghidra $GHIDRA_VERSION, pinning pyghidra==2.2.1..."
+            pip install "pyghidra==2.2.1"
+          fi
+
           # install package and testing
-          python -m pyhidra.install_plugins 
           pip install -e ".[testing]"
           pytest -rA

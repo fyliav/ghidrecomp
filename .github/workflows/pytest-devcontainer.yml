@@ -37,7 +37,15 @@ jobs:
         push: never
         # platform: linux/amd64,linux/arm64
         runCmd: |
-          pip install --upgrade pip          
+          pip install --upgrade pip
+          
+          # If Ghidra major version is 11
+          if [[ "$GHIDRA_VERSION" == 11.* ]]; then
+            echo "Detected Ghidra $GHIDRA_VERSION, pinning pyghidra==2.2.1..."
+            pip install "pyghidra==2.2.1"
+          fi
+
+          # Install package in editable mode 
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install -e .
           pytest -rA
