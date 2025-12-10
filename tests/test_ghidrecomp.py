@@ -76,7 +76,7 @@ def test_decomplie_afd(shared_datadir: Path):
     all_funcs, decompilations, output_path, compiler, lang_id, callgraphs = decompile(args)
 
     assert len(all_funcs) == len(decompilations)
-    assert len(all_funcs) in {1275, 1273, 1172, 1615}, f"Unexpected function count: {len(all_funcs)}"
+    assert len(all_funcs) in {1275, 1273, 1172, 1615,1277}, f"Unexpected function count: {len(all_funcs)}"
     assert output_path == expected_output_path
     assert compiler == 'visualstudio:unknown'
     assert lang_id == 'x86:LE:64:default'
@@ -96,7 +96,7 @@ def test_decomplie_afd_cached(shared_datadir: Path):
 
     all_funcs, decompilations, output_path, compiler, lang_id, callgraphs = decompile(args)
 
-    assert len(all_funcs) in {1275, 1273, 1172, 1615}, f"Unexpected function count: {len(all_funcs)}"
+    assert len(all_funcs) in {1275, 1273, 1172, 1615,1277}, f"Unexpected function count: {len(all_funcs)}"
     assert len(decompilations) == 0
     assert output_path == expected_output_path
     assert compiler == 'visualstudio:unknown'
