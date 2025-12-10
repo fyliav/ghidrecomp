@@ -3,7 +3,7 @@
 {
 	"name": "ghidrecomp",
 	// image from https://github.com/clearbluejar/ghidra-python
-	"image": "ghcr.io/clearbluejar/ghidra-python:latest", 
+	"image": "ghcr.io/clearbluejar/ghidra-python:11.4.3ghidra3.13python-bookworm",
 	// Configure tool-specific properties.
 	"customizations": {
 		// Configure properties specific to VS Code.
@@ -15,12 +15,12 @@
 				"python.formatting.blackPath": "/usr/local/py-utils/bin/black",
 				"python.formatting.yapfPath": "/usr/local/py-utils/bin/yapf",
 				// VS code settings for ghidra-stubs autocomplete
-				"python.analysis.stubPath": "${workspaceFolder}/.env/lib/python3.12/site-packages/ghidra-stubs/",
+				"python.analysis.stubPath": "${workspaceFolder}/.venv/lib/python3.12/site-packages/ghidra-stubs/",
 				"python.autoComplete.extraPaths": [
-					"${workspaceFolder}/.env/lib/python3.12/site-packages/ghidra-stubs/"
+					"${workspaceFolder}/.venv/lib/python3.12/site-packages/ghidra-stubs/"
 				],
 				"python.analysis.extraPaths": [
-					"${workspaceFolder}/.env/lib/python3.12/site-packages/ghidra-stubs/"
+					"${workspaceFolder}/.venv/lib/python3.12/site-packages/ghidra-stubs/"
 				],
 				"[python]": {
 					"editor.formatOnSave": true,
