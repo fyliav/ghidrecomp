@@ -320,7 +320,7 @@ def decompile(args: Namespace):
                 
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
-                    futures = (executor.submit(gen_callgraph, func, max_display_depth, direction, args.max_time_cg_gen, get_filename(func), not args.no_call_refs)
+                    futures = (executor.submit(gen_callgraph, func, max_display_depth, direction, args.max_time_cg_gen, get_filename(func), not args.no_call_refs, args.condense_threshold, args.top_layers, args.bottom_layers)
                                for direction in directions for func in all_funcs if args.skip_cache or get_filename(func) not in callgraphs_completed and re.search(args.callgraph_filter, func.name) is not None)
 
                     for future in concurrent.futures.as_completed(futures):

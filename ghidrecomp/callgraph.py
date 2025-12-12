@@ -5,6 +5,7 @@ import json
 import sys
 import re
 import argparse
+import collections
 
 from typing import TYPE_CHECKING
 from functools import lru_cache
@@ -30,6 +31,9 @@ def add_cg_args_to_parser(parser: argparse.ArgumentParser):
     group.add_argument('--cg-direction', help='Direction for callgraph.',
                        choices=['calling', 'called', 'both'], default='calling')
     group.add_argument('--no-call-refs', action='store_true', help='Do not include non-call references in callgraph')
+    group.add_argument('--condense-threshold', help='Number of edges to trigger graph condensation.', type=int, default=50)
+    group.add_argument('--top-layers', help='Number of top layers to show in condensed graph.', type=int, default=4)
+    group.add_argument('--bottom-layers', help='Number of bottom layers to show in condensed graph.', type=int, default=4)
 
 
 
@@ -167,16 +171,155 @@ class CallGraph:
                     queue.append(neighbor)
 
         return False
+
+    def get_all_paths_graph(self, source_func: str, dest_func: str) -> 'CallGraph':
+        """
+        Generates a new CallGraph containing only the edges that form paths
+        between source_func and dest_func.
+        """
+
+        def find_all_paths_dfs(start_node, end_node):
+            paths = []
+            
+            def dfs_recursive(current_node, current_path):
+                current_path.append(current_node)
+                
+                if current_node == end_node:
+                    paths.append(list(current_path))
+                else:
+                    for neighbor_tuple in self.graph.get(current_node, []):
+                        neighbor = neighbor_tuple[0]
+                        if neighbor not in current_path:
+                            dfs_recursive(neighbor, current_path)
+                
+                current_path.pop()
+
+            if start_node in self.graph:
+                dfs_recursive(start_node, [])
+            return paths
+
+        if source_func not in self.graph or dest_func not in self.graph:
+            return CallGraph(root=source_func)
+
+        all_paths = find_all_paths_dfs(source_func, dest_func)
+
+        path_graph = CallGraph(root=source_func)
+        
+        if not all_paths:
+            return path_graph
+
+        added_edges = set()
+
+        for path in all_paths:
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i+1]
+                
+                if (u, v) in added_edges:
+                    continue
+
+                for neighbor_tuple in self.graph.get(u, []):
+                    if neighbor_tuple[0] == v:
+                        # Original tuple: (node2, depth, self.count, ref_type)
+                        depth = neighbor_tuple[1]
+                        ref_type = neighbor_tuple[3]
+                        path_graph.add_edge(u, v, depth, ref_type)
+                        added_edges.add((u, v))
+                        break
+
+        return path_graph
+    
     
     @staticmethod
     def remove_bad_mermaid_chars(text: str):
         return re.sub(r'`','',text)
 
-    def gen_mermaid_flow_graph(self, direction=None, shaded_nodes: list = None, shade_color='#339933', max_display_depth=None, endpoint_only=False, wrap_mermaid=False) -> str:
+    def gen_mermaid_flow_graph(self, direction=None, shaded_nodes: list = None, shade_color='#339933', max_display_depth=None, endpoint_only=False, wrap_mermaid=False, condense_threshold=50, top_layers=5, bottom_layers=5) -> str:
         """
         Generate MermaidJS flowchart from self.graph
         See https://mermaid.js.org/syntax/flowchart.html
         """
+
+        if condense_threshold is not None and self.links_count() > condense_threshold and not endpoint_only:
+            # --- Condensation Logic ---
+            all_nodes = set(self.graph.keys())
+            edges = []
+            node_depths = {self.root: 0}
+
+            for src, edge_list in self.graph.items():
+                for dst, depth, _, _ in edge_list:
+                    all_nodes.add(dst)
+                    edges.append((src, dst))
+                    if dst not in node_depths or depth < node_depths.get(dst, float('inf')):
+                        node_depths[dst] = depth
+
+            # Calculate heights
+            rev_adj = {n: [] for n in all_nodes}
+            for src, dst in edges:
+                if dst in rev_adj:
+                    rev_adj[dst].append(src)
+            
+            leaves = {n for n in all_nodes if not self.graph.get(n)}
+
+            heights = {}
+            q = collections.deque([(leaf, 0) for leaf in leaves])
+            visited = set(leaves)
+            for l in leaves:
+                heights[l] = 0
+            while q:
+                node, height = q.popleft()
+                for parent in rev_adj.get(node, []):
+                    if parent not in visited:
+                        visited.add(parent)
+                        heights[parent] = height + 1
+                        q.append((parent, height + 1))
+            
+            # Identify nodes to keep
+            top_nodes = {n for n, d in node_depths.items() if d <= top_layers}
+            bottom_nodes = {n for n, h in heights.items() if h < bottom_layers}
+            kept_nodes = top_nodes | bottom_nodes
+            if self.root:
+                kept_nodes.add(self.root)
+
+            # --- Create condensed graph ---
+            condensed_cg = CallGraph(root=self.root)
+            
+            visible_edges = []
+            edges_to_condensed = set()
+            edges_from_condensed = set()
+
+            for src, edge_list in self.graph.items():
+                for dst, depth, count, ref_type in edge_list:
+                    src_kept = src in kept_nodes
+                    dst_kept = dst in kept_nodes
+
+                    if src_kept and dst_kept:
+                        visible_edges.append((src, dst, depth, ref_type))
+                    elif src_kept and not dst_kept:
+                        edges_to_condensed.add(src)
+                    elif not src_kept and dst_kept:
+                        edges_from_condensed.add(dst)
+
+            for src, dst, depth, ref_type in visible_edges:
+                condensed_cg.add_edge(src, dst, depth, ref_type)
+
+            num_hidden_nodes = len(all_nodes) - len(kept_nodes)
+            if num_hidden_nodes > 0:
+                hidden_links_count = self.links_count() - len(visible_edges)
+                condensed_node_name = f"... {hidden_links_count} hidden links across {num_hidden_nodes} nodes ..."
+                
+                condensed_depth = top_layers + 1
+                
+                for src in edges_to_condensed:
+                    condensed_cg.add_edge(src, condensed_node_name, condensed_depth, 'call')
+                    
+                for dst in edges_from_condensed:
+                    dst_depth = node_depths.get(dst, condensed_depth + 1)
+                    condensed_cg.add_edge(condensed_node_name, dst, dst_depth, 'call')
+            
+            # Overwrite self.graph with the condensed version
+            self.graph = condensed_cg.graph
+            self.count = condensed_cg.count
+            self.max_depth = condensed_cg.max_depth
 
         # TODO mark root node with circle
         # TODO mark end_points with shape
@@ -206,7 +349,7 @@ class CallGraph:
         else:
             style = ''
 
-        if len(self.graph) == 1:
+        if len(self.graph) == 1 and self.root in self.graph:
             links[self.root] = 1
         else:
 
@@ -646,7 +789,7 @@ A condensed view, showing only endpoints of the callgraph.
     return md_template
 
 
-def gen_callgraph(func: 'ghidra.program.model.listing.Function', max_display_depth=None, direction='calling', max_run_time=None, name=None, include_refs=True):
+def gen_callgraph(func: 'ghidra.program.model.listing.Function', max_display_depth=None, direction='calling', max_run_time=None, name=None, include_refs=True, condense_threshold=50, top_layers=5, bottom_layers=5):
 
     if name is None:
         name = f'{func.getName()[:MAX_PATH_LEN]}-{func.entryPoint}'    
@@ -666,7 +809,10 @@ def gen_callgraph(func: 'ghidra.program.model.listing.Function', max_display_dep
         flow = callgraph.gen_mermaid_flow_graph(
             shaded_nodes=callgraph.get_endpoints(),
             max_display_depth=max_display_depth,
-            wrap_mermaid=True)
+            wrap_mermaid=True,
+            condense_threshold=condense_threshold,
+            top_layers=top_layers,
+            bottom_layers=bottom_layers)
         flow_ends = callgraph.gen_mermaid_flow_graph(
             shaded_nodes=callgraph.get_endpoints(), endpoint_only=True, wrap_mermaid=True)
         mind = callgraph.gen_mermaid_mind_map(max_display_depth=3, wrap_mermaid=True)
