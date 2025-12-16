@@ -9,7 +9,7 @@ import hashlib
 from pyghidra import HeadlessPyGhidraLauncher, open_program
 
 from .utility import set_pdb, setup_symbol_server, set_remote_pdbs, analyze_program, get_pdb, apply_gdt, save_program_as_gzf
-from .callgraph import get_called, get_calling, CallGraph, gen_callgraph
+from .callgraph import gen_callgraph
 from .bsim import gen_bsim_sigs_for_program, has_bsim
 
 # needed for ghidra python vscode autocomplete
@@ -320,7 +320,7 @@ def decompile(args: Namespace):
                 
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
-                    futures = (executor.submit(gen_callgraph, func, max_display_depth, direction, args.max_time_cg_gen, get_filename(func), not args.no_call_refs, args.condense_threshold, args.top_layers, args.bottom_layers)
+                    futures = (executor.submit(gen_callgraph, func, max_display_depth, direction, args.max_time_cg_gen, get_filename(func), not args.no_call_refs, args.condense_threshold, args.top_layers, args.bottom_layers, wrap_mermaid=True)
                                for direction in directions for func in all_funcs if args.skip_cache or get_filename(func) not in callgraphs_completed and re.search(args.callgraph_filter, func.name) is not None)
 
                     for future in concurrent.futures.as_completed(futures):
@@ -329,7 +329,13 @@ def decompile(args: Namespace):
                         name, direction, callgraph, graphs = callgraphs[-1]
 
                         for ctype, chart in graphs:
-                            (callgraph_path / (name + f'.{ctype}.{direction}.md')).write_text(chart)
+                            if ctype == "mermaid_url":
+                                # Special case: write the URL into its own md file
+                                (callgraph_path / f"{name}.url.{direction}.md").write_text(chart)
+                            else:
+                                # Normal case: write chart content
+                                (callgraph_path / f"{name}.{ctype}.{direction}.md").write_text(chart)
+
                         callgraphs_completed.append(name)
 
                         completed += 1

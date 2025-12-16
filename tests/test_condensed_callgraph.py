@@ -6,7 +6,7 @@ from pathlib import Path
 from ghidrecomp import decompile, get_parser
 
 # Number of functions to generate to ensure we exceed the default condense_threshold of 50
-NUM_FUNCS = 55 # Using 55 to ensure enough functions for condensation
+NUM_FUNCS = 200 # Using 55 to ensure enough functions for condensation
 
 @pytest.fixture(scope="module")
 def condensed_test_binary():
@@ -89,8 +89,10 @@ def test_condensed_called_callgraph(condensed_test_binary):
         if ctype == 'flow':
             flow_chart = chart
             break
-            
+
     assert "hidden links" in flow_chart, "Called callgraph for main was not condensed"
+    assert "main" in flow_chart, "Called callgraph for main missing expected function main"
+    assert "printf" in flow_chart, "Bottom layers missing expected function printf"
 
 def test_condensed_calling_callgraph(condensed_test_binary):
     """
@@ -104,7 +106,54 @@ def test_condensed_calling_callgraph(condensed_test_binary):
         "--callgraphs",
         "--cg-direction", "calling", # Request calling graph
         "--skip-cache",
-        "--filter", "printf" # Filter for sink_func
+        "--filter", "printf", # Filter for sink_func
+        "--top-layers", "2", # Limit to top 2 layers to keep test fast
+        "--bottom-layers", "2",
+        "--max-time-cg-gen", "360",
+    ])
+
+    all_funcs, decompilations, output_path, compiler, lang_id, callgraphs = decompile(args)
+
+    assert len(callgraphs) > 0, "No callgraphs were generated"
+
+    printf_calling_graph_data = None
+    for name, direction, callgraph, graphs in callgraphs:
+        if "printf" in name and direction == "calling":
+            if graphs[0][1] == graphs[1][1]:
+                continue # Skip strange case with externals
+            printf_calling_graph_data = graphs
+            break
+    
+    assert printf_calling_graph_data is not None, "Could not find 'calling' graph for sink_func"
+
+    flow_chart = ""
+    for ctype, chart in printf_calling_graph_data:
+        if ctype == 'flow':
+            flow_chart = chart
+            break
+            
+    
+    assert "hidden links" in flow_chart, "Calling callgraph for sink_func was not condensed"
+    assert "main" in flow_chart, "Calling callgraph for sink_func missing expected function main"
+    assert "f0" in flow_chart, "Top layers missing expected function f0"
+    assert "f2" not in flow_chart, "Function f1 should be condensed out"
+    assert "printf" in flow_chart, "Bottom layers missing expected function printf"
+    assert "f198" not in flow_chart, "Function f199 should be condensed out"
+    
+def test_condensed_calling_callgraph_dynamic(condensed_test_binary):
+    """
+    Tests that a large 'calling' callgraph (e.g., for sink_func) is condensed.
+    """
+    bin_file = Path(condensed_test_binary)
+
+    parser = get_parser()
+    args = parser.parse_args([
+        str(bin_file.absolute()),
+        "--callgraphs",
+        "--cg-direction", "calling", # Request calling graph
+        "--skip-cache",
+        "--filter", "printf", # Filter for sink_func
+        "--max-time-cg-gen", "360",
     ])
 
     all_funcs, decompilations, output_path, compiler, lang_id, callgraphs = decompile(args)
@@ -128,3 +177,5 @@ def test_condensed_calling_callgraph(condensed_test_binary):
             break
             
     assert "hidden links" in flow_chart, "Calling callgraph for sink_func was not condensed"
+    assert "main" in flow_chart, "Calling callgraph for sink_func missing expected function main"
+    assert "printf" in flow_chart, "Bottom layers missing expected function printf"

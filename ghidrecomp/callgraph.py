@@ -32,8 +32,8 @@ def add_cg_args_to_parser(parser: argparse.ArgumentParser):
                        choices=['calling', 'called', 'both'], default='calling')
     group.add_argument('--no-call-refs', action='store_true', help='Do not include non-call references in callgraph')
     group.add_argument('--condense-threshold', help='Number of edges to trigger graph condensation.', type=int, default=50)
-    group.add_argument('--top-layers', help='Number of top layers to show in condensed graph.', type=int, default=4)
-    group.add_argument('--bottom-layers', help='Number of bottom layers to show in condensed graph.', type=int, default=4)
+    group.add_argument('--top-layers', help='Number of top layers to show in condensed graph.', type=int, default=None)
+    group.add_argument('--bottom-layers', help='Number of bottom layers to show in condensed graph.', type=int, default=None)
 
 
 
@@ -233,65 +233,146 @@ class CallGraph:
     def remove_bad_mermaid_chars(text: str):
         return re.sub(r'`','',text)
 
-    def gen_mermaid_flow_graph(self, direction=None, shaded_nodes: list = None, shade_color='#339933', max_display_depth=None, endpoint_only=False, wrap_mermaid=False, condense_threshold=50, top_layers=5, bottom_layers=5) -> str:
+    
+    def gen_mermaid_flow_graph(
+            self,
+            direction=None,
+            shaded_nodes: list = None,
+            shade_color='#339933',
+            max_display_depth=None,
+            endpoint_only=False,
+            wrap_mermaid=False,
+            condense_threshold=50,
+            top_layers=None,
+            bottom_layers=None,
+            preserve_root_layers=2,
+            preserve_leaf_layers=2
+        ) -> str:
         """
         Generate MermaidJS flowchart from self.graph
-        See https://mermaid.js.org/syntax/flowchart.html
         """
 
+        used_condensed = False
+        condensed_cg = None
+
+        # Condense only if graph is large enough and not endpoint-only
         if condense_threshold is not None and self.links_count() > condense_threshold and not endpoint_only:
-            # --- Condensation Logic ---
+            import collections
+
+            # --- Step 1: Collect nodes and edges ---
+            # Build a list of all nodes and edges, and record depth from root.
             all_nodes = set(self.graph.keys())
-            edges = []
+            edges_raw = []
             node_depths = {self.root: 0}
-
             for src, edge_list in self.graph.items():
-                for dst, depth, _, _ in edge_list:
+                for dst, depth_val, _, _ in edge_list:
                     all_nodes.add(dst)
-                    edges.append((src, dst))
-                    if dst not in node_depths or depth < node_depths.get(dst, float('inf')):
-                        node_depths[dst] = depth
+                    edges_raw.append((src, dst, depth_val))
+                    if dst not in node_depths or depth_val < node_depths.get(dst, float('inf')):
+                        node_depths[dst] = depth_val
 
-            # Calculate heights
+            # --- Step 2: Build reverse adjacency ---
+            # Reverse adjacency lets us walk upward (toward parents).
             rev_adj = {n: [] for n in all_nodes}
-            for src, dst in edges:
-                if dst in rev_adj:
-                    rev_adj[dst].append(src)
-            
-            leaves = {n for n in all_nodes if not self.graph.get(n)}
+            for src, dst, _ in edges_raw:
+                rev_adj[dst].append(src)
 
-            heights = {}
-            q = collections.deque([(leaf, 0) for leaf in leaves])
-            visited = set(leaves)
-            for l in leaves:
-                heights[l] = 0
-            while q:
-                node, height = q.popleft()
-                for parent in rev_adj.get(node, []):
-                    if parent not in visited:
-                        visited.add(parent)
-                        heights[parent] = height + 1
-                        q.append((parent, height + 1))
-            
-            # Identify nodes to keep
-            top_nodes = {n for n, d in node_depths.items() if d <= top_layers}
-            bottom_nodes = {n for n, h in heights.items() if h < bottom_layers}
+            # --- Step 3: Compute heights ---
+            # Heights measure distance from leaves (callee graph) or entry points (calling graph).
+            graph_direction = self.get_direction()
+            if graph_direction and str(graph_direction).upper() == "CALLING":
+                # In a calling graph, root is a leaf (like printf).
+                # So compute heights from entry points (nodes with no parents).
+                entry_points = {n for n in all_nodes if not rev_adj.get(n)}
+                heights = {ep: 0 for ep in entry_points}
+                q = collections.deque([(ep, 0) for ep in entry_points])
+                visited = set(entry_points)
+                while q:
+                    node, h = q.popleft()
+                    for child in self.graph.get(node, []):
+                        dst = child[0]
+                        if dst not in visited:
+                            visited.add(dst)
+                            heights[dst] = h + 1
+                            q.append((dst, h + 1))
+            else:
+                # In a callee graph, root is entry point (like main).
+                # Compute heights from leaves upward.
+                leaves = {n for n in all_nodes if not self.graph.get(n)}
+                heights = {l: 0 for l in leaves}
+                q = collections.deque([(leaf, 0) for leaf in leaves])
+                visited = set(leaves)
+                while q:
+                    node, h = q.popleft()
+                    for parent in rev_adj.get(node, []):
+                        if parent not in visited:
+                            visited.add(parent)
+                            heights[parent] = h + 1
+                            q.append((parent, h + 1))
+
+            # --- Step 4: Auto-calc top/bottom layer thresholds ---
+            # Decide how many layers to keep at the top and bottom before condensing.
+            if top_layers is None:
+                current_top_layers = 0
+                current_total_edges_top = 0
+                for d in range(0, self.max_depth + 1):
+                    edges_at_depth = sum(1 for _, _, depth_val in edges_raw if depth_val == d)
+                    if (current_total_edges_top + edges_at_depth) > (condense_threshold // 2):
+                        break
+                    current_total_edges_top += edges_at_depth
+                    current_top_layers = d
+                top_layers = current_top_layers
+
+            if bottom_layers is None:
+                current_bottom_layers = 0
+                current_total_nodes_bottom = 0
+                max_height_val = max(heights.values()) if heights else 0
+                for h in range(max_height_val + 1):
+                    nodes_at_height = sum(1 for _, ht in heights.items() if ht == h)
+                    if (current_total_nodes_bottom + nodes_at_height) > (condense_threshold // 2):
+                        if h == max_height_val:
+                            current_total_nodes_bottom += nodes_at_height
+                            current_bottom_layers = h + 1
+                        break
+                    current_total_nodes_bottom += nodes_at_height
+                    current_bottom_layers = h + 1
+                bottom_layers = current_bottom_layers
+
+            # --- Step 5: Enforce minimum preservation ---
+            # Always keep at least N root layers and N leaf layers.
+            top_layers = max(preserve_root_layers, top_layers)
+            bottom_layers = max(preserve_leaf_layers, bottom_layers)
+
+            # --- Step 6: Select nodes to keep ---
+            # Top nodes: near root (callee) or entry points (calling).
+            # Bottom nodes: near leaves (callee) or near root leaf (calling).
+            if graph_direction and str(graph_direction).upper() == "CALLING":
+                top_nodes = {n for n, h in heights.items() if h <= top_layers}
+                bottom_nodes = {n for n, d in node_depths.items() if d <= (bottom_layers) and n not in top_nodes}
+                condensed_depth = max(node_depths.get(self.root, 0), top_layers + 1)
+            else:
+                top_nodes = {n for n, d in node_depths.items() if d <= top_layers}
+                bottom_nodes = {n for n, h in heights.items() if h <= (bottom_layers) and n not in top_nodes}
+                condensed_depth = top_layers + 1
+
             kept_nodes = top_nodes | bottom_nodes
             if self.root:
                 kept_nodes.add(self.root)
 
-            # --- Create condensed graph ---
+            num_hidden_nodes = len(all_nodes) - len(kept_nodes)
+
+            # --- Step 7: Build condensed graph ---
+            # Replace middle of graph with a single placeholder node summarizing hidden nodes/edges.
             condensed_cg = CallGraph(root=self.root)
-            
             visible_edges = []
             edges_to_condensed = set()
             edges_from_condensed = set()
 
+            # Separate visible edges from those that collapse into condensed node
             for src, edge_list in self.graph.items():
                 for dst, depth, count, ref_type in edge_list:
                     src_kept = src in kept_nodes
                     dst_kept = dst in kept_nodes
-
                     if src_kept and dst_kept:
                         visible_edges.append((src, dst, depth, ref_type))
                     elif src_kept and not dst_kept:
@@ -299,109 +380,73 @@ class CallGraph:
                     elif not src_kept and dst_kept:
                         edges_from_condensed.add(dst)
 
+            # Add visible edges directly
             for src, dst, depth, ref_type in visible_edges:
                 condensed_cg.add_edge(src, dst, depth, ref_type)
 
-            num_hidden_nodes = len(all_nodes) - len(kept_nodes)
+            # Add condensed placeholder node if needed
             if num_hidden_nodes > 0:
                 hidden_links_count = self.links_count() - len(visible_edges)
                 condensed_node_name = f"... {hidden_links_count} hidden links across {num_hidden_nodes} nodes ..."
-                
-                condensed_depth = top_layers + 1
-                
                 for src in edges_to_condensed:
                     condensed_cg.add_edge(src, condensed_node_name, condensed_depth, 'call')
-                    
                 for dst in edges_from_condensed:
                     dst_depth = node_depths.get(dst, condensed_depth + 1)
                     condensed_cg.add_edge(condensed_node_name, dst, dst_depth, 'call')
-            
-            # Overwrite self.graph with the condensed version
-            self.graph = condensed_cg.graph
-            self.count = condensed_cg.count
-            self.max_depth = condensed_cg.max_depth
 
-        # TODO mark root node with circle
-        # TODO mark end_points with shape
+            used_condensed = True
 
-        # used to create a key index for flowchart ids
-        # once defineed, a func name can be represented by a symbol, saving space
-        node_keys = {}
-        node_count = 0
-        existing_base_links = set()
+        # --- Step 8: Mermaid chart construction ---
+        # Build the flowchart text from either the condensed graph (if used) or the original graph.
+        node_keys = {}              # Maps node names to numeric IDs for Mermaid
+        node_count = 0              # Counter for assigning IDs
+        existing_base_links = set() # Tracks links already added to avoid duplicates
+        shade_key = 'sh'            # Style key for shaded nodes
+        links = {}                  # Dictionary of Mermaid link strings
 
-        shade_key = 'sh'
-
-        # use dict to preserve order of links
-        links = {}
-
-        # guess best orientation
+        # Choose chart direction: TD (top-down) for small graphs, LR (left-right) for large ones
         if not direction:
-            if len(self.graph) < 350:
-                direction = 'TD'
-            else:
-                direction = 'LR'
+            direction = 'TD' if len(self.graph) < 350 else 'LR'
 
         mermaid_flow = '''flowchart {direction}\n{style}\n{links}\n'''
+        style = f'classDef {shade_key} fill:{shade_color}' if shaded_nodes else ''
 
-        if shaded_nodes:
-            style = f'''classDef {shade_key} fill:{shade_color}'''
-        else:
-            style = ''
+        # Decide which graph to render: condensed or original
+        graph_to_use = condensed_cg.graph if used_condensed else self.graph
 
-        if len(self.graph) == 1 and self.root in self.graph:
+        # --- Step 9: Handle trivial case (single root node) ---
+        if len(graph_to_use) == 1 and self.root in graph_to_use:
             links[self.root] = 1
         else:
-
             if endpoint_only:
-
+                # --- Step 10: Endpoint-only mode ---
+                # Show only root and endpoints, skipping intermediate nodes
                 endpoints = self.get_endpoints()
-
                 for i, end in enumerate(endpoints):
-
-                    if shaded_nodes and end in shaded_nodes:
-                        end_style_class = f':::{shade_key}'
-                    else:
-                        end_style_class = ''
-
-                    if shaded_nodes and self.root in shaded_nodes:
-                        root_style_class = f':::{shade_key}'
-                    else:
-                        root_style_class = ''
-
+                    end_style_class = f':::{shade_key}' if shaded_nodes and end in shaded_nodes else ''
+                    root_style_class = f':::{shade_key}' if shaded_nodes and self.root in shaded_nodes else ''
                     if self.root_at_end():
                         link = f'{i}["{end}"]{end_style_class} --> root["{self.root}"]{root_style_class}'
                     else:
                         link = f'root["{self.root}"]{root_style_class} --> {i}["{end}"]{end_style_class}'
-
                     links[link] = 1
-
             else:
-
-                for src in list(self.graph):
-
-                    if shaded_nodes and src in shaded_nodes:
-                        src_style_class = f':::{shade_key}'
-                    else:
-                        src_style_class = ''
-
-                    for node in list(self.graph[src]):
-
+                # --- Step 11: Full graph rendering ---
+                # Iterate through nodes and edges, building Mermaid links
+                for src in list(graph_to_use):
+                    src_style_class = f':::{shade_key}' if shaded_nodes and src in shaded_nodes else ''
+                    for node in list(graph_to_use[src]):
                         depth = node[1]
                         fname = node[0]
                         ref_type = node[3]
 
+                        # Skip edges deeper than max_display_depth if specified
                         if max_display_depth is not None and depth > max_display_depth:
                             continue
 
-                        if shaded_nodes and fname in shaded_nodes:
-                            dst_style_class = f':::{shade_key}'
-                        else:
-                            dst_style_class = ''
+                        dst_style_class = f':::{shade_key}' if shaded_nodes and fname in shaded_nodes else ''
 
-                        # Build src --> dst link
-                        # Don't add duplicate links
-                        # Use short ids for func name to save space with node_keys
+                        # Assign numeric IDs for Mermaid nodes if not already assigned
                         if node_keys.get(src) is None:
                             node_keys[src] = node_count
                             node_count += 1
@@ -416,28 +461,32 @@ class CallGraph:
                         else:
                             dst_node = f'{node_keys[fname]}{dst_style_class}'
 
-                        # record base link
+                        # Avoid duplicate links
                         current_base_link = f'{src} --> {node[0]}'
-
-                        # don't add link if another already exists
-                        if not current_base_link in existing_base_links:
+                        if current_base_link not in existing_base_links:
                             if ref_type == 'ref':
                                 link = f'{src_node} -- ref --> {dst_node}'
-                            else: # 'call'
+                            else:
                                 link = f'{src_node} --> {dst_node}'
                             links[link] = 1
                             existing_base_links.add(current_base_link)
-                        # else:
-                        #     print('Duplicate base link found!')
 
-        mermaid_chart = mermaid_flow.format(links='\n'.join(links.keys()), direction=direction, style=style)
+        # --- Step 12: Finalize Mermaid chart ---
+        mermaid_chart = mermaid_flow.format(
+            links='\n'.join(links.keys()),
+            direction=direction,
+            style=style
+        )
 
+        # Clean up invalid characters for Mermaid syntax
         mermaid_chart = self.remove_bad_mermaid_chars(mermaid_chart)
 
+        # Optionally wrap chart in embedding markup
         if wrap_mermaid:
             mermaid_chart = _wrap_mermaid(mermaid_chart)
 
         return mermaid_chart
+
 
     def gen_mermaid_mind_map(self, max_display_depth=None, wrap_mermaid=False) -> str:
         """
@@ -715,9 +764,16 @@ def get_called(f: "ghidra.program.model.listing.Function", cgraph: CallGraph = N
 def _wrap_mermaid(text: str) -> str:
     return f'''```mermaid\n{text}\n```'''
 
+def _unwrap_mermaid(wrapped: str) -> str:
+    prefix = "```mermaid\n"
+    suffix = "\n```"
+    if wrapped.startswith(prefix) and wrapped.endswith(suffix):
+        return wrapped[len(prefix):-len(suffix)]
+    return wrapped
+
 
 def gen_mermaid_url(graph: str, edit=False) -> str:
-    """
+    """mermaidInkSvg
     Generate valid mermaid live edit and image links
     # based on serialize func  https://github.com/mermaid-js/mermaid-live-editor/blob/b5978e6faf7635e39452855fb4d062d1452ab71b/src/lib/util/serde.ts#L19-L24
     """
@@ -730,6 +786,72 @@ def gen_mermaid_url(graph: str, edit=False) -> str:
         url = f'https://mermaid.live/edit#pako:{base64_string}'
     else:
         url = f'https://mermaid.ink/img/svg/pako:{base64_string}'
+
+    return url
+
+
+import base64
+import zlib
+import json
+from typing import Optional, Dict, Any
+
+def gen_mermaid_url(
+    graph: str,
+    edit: bool = False,
+    # Optional State params
+    mermaid_config_json: Optional[Dict[str, Any]] = None,
+    updateDiagram: bool = True,
+    rough: bool = False,
+    renderCount: Optional[int] = None,
+    panZoom: Optional[bool] = True,
+    grid: Optional[bool] = True,
+    editorMode: Optional[str] = "code",
+    pan: Optional[Dict[str, float]] = None,
+    zoom: Optional[float] = None,
+    loader: Optional[Dict[str, Any]] = None,
+    autoSync: bool = True,
+    updateEditor: bool = True,
+) -> str:
+    """
+    Generate valid Mermaid live edit and image links.
+    Updated to match new State interface with optional params.
+    # based on serialize func  https://github.com/mermaid-js/mermaid-live-editor/blob/b5978e6faf7635e39452855fb4d062d1452ab71b/src/lib/util/serde.ts#L19-L24
+    """
+
+    mm_state = {
+        "code": graph,
+        "mermaid": json.dumps(mermaid_config_json or {"theme": "dark"}),  # stringified JSON
+        "updateDiagram": updateDiagram,
+        "rough": rough,
+        "updateEditor": updateEditor,
+        "autoSync": autoSync,
+    }
+
+    # Add optional fields only if provided
+    if renderCount is not None:
+        mm_state["renderCount"] = renderCount
+    if panZoom is not None:
+        mm_state["panZoom"] = panZoom
+    if grid is not None:
+        mm_state["grid"] = grid
+    if editorMode is not None:
+        mm_state["editorMode"] = editorMode
+    if pan is not None:
+        mm_state["pan"] = pan
+    if zoom is not None:
+        mm_state["zoom"] = zoom
+    if loader is not None:
+        mm_state["loader"] = loader
+
+    # Compress + encode
+    base64_string = base64.urlsafe_b64encode(
+        zlib.compress(json.dumps(mm_state).encode("utf-8"), 9)
+    ).decode("ascii")
+
+    if edit:
+        url = f"https://mermaid.live/edit#pako:{base64_string}"
+    else:
+        url = f"https://mermaid.ink/svg/pako:{base64_string}"  # updated endpoint
 
     return url
 
@@ -789,7 +911,7 @@ A condensed view, showing only endpoints of the callgraph.
     return md_template
 
 
-def gen_callgraph(func: 'ghidra.program.model.listing.Function', max_display_depth=None, direction='calling', max_run_time=None, name=None, include_refs=True, condense_threshold=50, top_layers=5, bottom_layers=5):
+def gen_callgraph(func: 'ghidra.program.model.listing.Function', max_display_depth=None, direction='calling', max_run_time=None, name=None, include_refs=True, condense_threshold=50, top_layers=5, bottom_layers=5, wrap_mermaid=False):
 
     if name is None:
         name = f'{func.getName()[:MAX_PATH_LEN]}-{func.entryPoint}'    
@@ -809,12 +931,13 @@ def gen_callgraph(func: 'ghidra.program.model.listing.Function', max_display_dep
         flow = callgraph.gen_mermaid_flow_graph(
             shaded_nodes=callgraph.get_endpoints(),
             max_display_depth=max_display_depth,
-            wrap_mermaid=True,
+            wrap_mermaid=wrap_mermaid,
             condense_threshold=condense_threshold,
             top_layers=top_layers,
-            bottom_layers=bottom_layers)
+            bottom_layers=bottom_layers)        
         flow_ends = callgraph.gen_mermaid_flow_graph(
-            shaded_nodes=callgraph.get_endpoints(), endpoint_only=True, wrap_mermaid=True)
-        mind = callgraph.gen_mermaid_mind_map(max_display_depth=3, wrap_mermaid=True)
+            shaded_nodes=callgraph.get_endpoints(), endpoint_only=True, wrap_mermaid=wrap_mermaid)
+        mind = callgraph.gen_mermaid_mind_map(max_display_depth=3, wrap_mermaid=wrap_mermaid)
+        cg_mermaid_url = gen_mermaid_url(_unwrap_mermaid(flow)) + "\n" + gen_mermaid_url(_unwrap_mermaid(flow), edit=True)
 
-    return [name, direction, callgraph, [['flow', flow], ['flow_ends', flow_ends], ['mind', mind]]]
+    return [name, direction, callgraph, [['flow', flow], ['flow_ends', flow_ends], ['mind', mind], ['mermaid_url', cg_mermaid_url]]]
