@@ -184,7 +184,19 @@ def decompile(args: Namespace):
     if args.print_flags:
         launcher.add_vmargs('-XX:+PrintFlagsFinal')
 
-    launcher.start()
+    try:
+        launcher.start()
+    except ValueError as e:
+        if "minimum required version" in str(e).lower():
+            print(f"\nError:")
+            print(f"[Version Error] {e}")
+            print("Resolution options:")
+            print("  - Upgrade Ghidra to version 12.0 or newer")
+            print("  - OR downgrade pyghidra to 2.2.1 for Ghidra 11.x")
+            print("    Run: pip install pyghidra==2.2.1")
+            exit(1)
+        raise e
+       
 
     from ghidra.util.task import ConsoleTaskMonitor
     monitor = ConsoleTaskMonitor()
